@@ -1,0 +1,4 @@
+﻿library optmath
+a = fraction(12, 18)
+b = fraction(3, 4)
+display fraction_add(a, b)
