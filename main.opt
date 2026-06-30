@@ -1,4 +1,130 @@
-﻿library optmath
-a = fraction(12, 18)
-b = fraction(3, 4)
-display fraction_add(a, b)
+﻿! ===================================================
+!  sample.opt - an introduction to the Optimize language
+! ===================================================
+!  Run it with:  optimize sample.opt
+! ===================================================
+
+display "Welcome to Optimize!"
+display "----------------------------"
+
+! ───────────────────────────────
+!  1. Variables
+! ───────────────────────────────
+! 'var' sets a variable, or updates it if it already exists.
+
+var name = "Alex"
+var age = 28
+
+display "1. Variables"
+display name
+display age
+
+! ───────────────────────────────
+!  2. Lists
+! ───────────────────────────────
+
+list fruits = ["apple", "banana", "cherry"]
+
+display "2. Lists"
+display fruits
+display "Number of fruits:"
+display len(fruits)
+display "First fruit:"
+display fruits[0]
+display "Last fruit:"
+display fruits[last_item]
+
+add fruits "date"
+display "After adding 'date':"
+display fruits
+
+del fruits "banana"
+display "After removing 'banana':"
+display fruits
+
+! ───────────────────────────────
+!  3. If / elseif / else
+! ───────────────────────────────
+
+display "3. Conditionals"
+
+if (age >= 18):
+    display "You are an adult."
+elseif (age >= 13):
+    display "You are a teenager."
+else:
+    display "You are a child."
+end
+
+! ───────────────────────────────
+!  4. Loops
+! ───────────────────────────────
+
+display "4. Loops"
+
+display "Counting with for:"
+for (i = 0, i += 1, i < len(fruits)):
+    display fruits[i]
+end
+
+display "Counting down with while:"
+var countdown = 3
+while (countdown > 0):
+    display countdown
+    countdown -= 1
+end
+display "Liftoff!"
+
+! ───────────────────────────────
+!  5. Functions
+! ───────────────────────────────
+
+display "5. Functions"
+
+function greet(person)
+    return "Hello, " + person + "!"
+end
+
+display greet(name)
+
+function add_numbers(a, b)
+    return a + b
+end
+
+display add_numbers(3, 4)
+
+! ───────────────────────────────
+!  6. User input
+! ───────────────────────────────
+
+display "6. Input"
+input int favorite_number "Pick your favorite number: "
+display "You picked:"
+display favorite_number
+
+! ───────────────────────────────
+!  7. Library modules
+! ───────────────────────────────
+! Optimize ships with a few built-in modules. Here's a quick taste
+! of optmath, optstr, and algorithm.
+
+library optmath
+library optstr
+library algorithm
+
+display "7. Library modules"
+
+display "sqrt(49) from optmath:"
+display sqrt(49)
+
+display "upper('optimize') from optstr:"
+display upper("optimize")
+
+list scores = [88, 92, 75, 100, 60]
+set_container(scores)
+sort(scores.start(), scores.end())
+display "scores sorted with the algorithm module:"
+display scores
+
+display "----------------------------"
+display "That's the basics. Happy coding!"

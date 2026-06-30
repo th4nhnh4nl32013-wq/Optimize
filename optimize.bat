@@ -21,7 +21,6 @@ set SCRIPT_DIR=%~dp0
 
 if "%~1"=="-help" goto :help
 if "%~1"=="-ver" goto :ver
-if "%~1"=="" goto :interactive
 
 python "%SCRIPT_DIR%main.py" %*
 goto :eof
@@ -36,13 +35,7 @@ echo  optimize -ver           Show version
 goto :eof
 
 :ver
-echo Optimize version v0.0.1
-goto :eof
-
-:interactive
-echo Optimize Interactive Shell (type exit() to quit)
-echo Note: multi-line statements are not supported.
-python -c &CODE&
+echo Optimize version v0.1
 goto :eof
 
 endlocal
