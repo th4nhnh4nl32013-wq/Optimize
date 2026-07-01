@@ -26,7 +26,7 @@ class StopException(Exception):   # break
 global_vars  = {}
 functions    = {}
 loaded_libs  = set()
-PACKAGE_DIR  = "package"
+PACKAGE_DIR  = r"C:\Users\Hi\OneDrive\Desktop\Optimize\package"
 
 # ─────────────────────────────────────────────
 #  Scope object  (Lua-style local/global)
