@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(python *)",
-      "PowerShell(python C:\\\\Users\\\\Hi\\\\OneDrive\\\\Desktop\\\\Optimize\\\\main.py C:\\\\Users\\\\Hi\\\\OneDrive\\\\Desktop\\\\Optimize\\\\test_bare_new.opt)",
-      "PowerShell(python C:\\\\Users\\\\Hi\\\\OneDrive\\\\Desktop\\\\Optimize\\\\main.py C:\\\\Users\\\\Hi\\\\OneDrive\\\\Desktop\\\\Optimize\\\\test_var.opt)"
-    ]
-  }
-}
