@@ -85,4 +85,6 @@ def repl():
             pass
 
 if __name__ == "__main__":
+    print("Optimize Interactive IDE v0.1")
+    print("----------------------------------------")
     repl()

@@ -26,7 +26,8 @@ class StopException(Exception):   # break
 global_vars  = {}
 functions    = {}
 loaded_libs  = set()
-PACKAGE_DIR  = r"C:\Users\Hi\OneDrive\Desktop\Optimize\package"
+lib_exports  = {}   # {lib_name: [list of symbol names it added to global_vars]}
+PACKAGE_DIR  = "package"
 
 # ─────────────────────────────────────────────
 #  Scope object  (Lua-style local/global)
@@ -65,6 +66,13 @@ class Scope:
                 frame[name] = value
                 return
         global_vars[name] = value
+
+    def delete(self, name):
+        for frame in reversed(self.frames):
+            if name in frame:
+                del frame[name]
+                return
+        raise OptimizeError(f"Cannot delete '{name}': name is not defined.")
 
     def as_dict(self):
         merged = {}
@@ -225,11 +233,30 @@ def extract_function_call(text: str):
 #  Value parser
 # ─────────────────────────────────────────────
 
+def _is_pure_string_literal(raw: str):
+    """Returns True only if `raw` is ENTIRELY one quoted string
+    literal with nothing else around it - e.g. '"hi"' is, but
+    '"hi" + x' merely starts and ends with a quote character and is
+    NOT a pure literal (it's a concatenation expression)."""
+    if len(raw) < 2:
+        return False
+    quote = raw[0]
+    if quote not in ('"', "'"):
+        return False
+    if raw[-1] != quote:
+        return False
+    # Walk the inside; if the same quote character appears again
+    # before the final character, the "literal" actually ends
+    # earlier and there's more content after it (so it's not pure).
+    for ch in raw[1:-1]:
+        if ch == quote:
+            return False
+    return True
+
 def parse_value(raw: str, scope: Scope):
     raw = raw.strip()
 
-    if (raw.startswith('"') and raw.endswith('"')) or \
-       (raw.startswith("'") and raw.endswith("'")):
+    if _is_pure_string_literal(raw):
         return raw[1:-1]
 
     if raw == "True":
@@ -465,6 +492,18 @@ def handle_library(rest: str, scope: Scope):
     opt_path = os.path.join(PACKAGE_DIR, f"{name}.opt")
     py_path  = os.path.join(PACKAGE_DIR, f"{name}.py")
 
+    # `library del <name>` — unload a previously loaded library,
+    # removing all the names it contributed to global_vars.
+    if name.startswith("del "):
+        lib_name = name[4:].strip()
+        if lib_name not in loaded_libs:
+            raise OptimizeError(f"Library '{lib_name}' is not loaded.")
+        for sym in lib_exports.get(lib_name, []):
+            global_vars.pop(sym, None)
+        loaded_libs.discard(lib_name)
+        lib_exports.pop(lib_name, None)
+        return
+
     # Load Optimize library
     if os.path.isfile(opt_path):
         with open(opt_path, "r", encoding="utf-8-sig") as f:
@@ -484,6 +523,7 @@ def handle_library(rest: str, scope: Scope):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
 
+        exported = []
         for attr in dir(module):
             if attr.startswith("_"):
                 continue
@@ -492,12 +532,15 @@ def handle_library(rest: str, scope: Scope):
 
             if callable(obj):
                 global_vars[attr] = obj
+                exported.append(attr)
             elif isinstance(obj, (int, float, str, bool, list, tuple)):
                 # Export simple constants too (e.g. pi, e) so Python
                 # libraries can expose values, not just functions.
                 global_vars[attr] = list(obj) if isinstance(obj, tuple) else obj
+                exported.append(attr)
 
         loaded_libs.add(name)
+        lib_exports[name] = exported
         return
 
     raise OptimizeError(
@@ -564,6 +607,25 @@ def dispatch(line: str, scope: Scope):
     if line == "escape":        return
     if line == "next":          raise NextException()
     if line == "stop":          raise StopException()
+
+    # `keyword del <name>` — delete a named var/list/library/function
+    # entirely, so the user can free something they no longer need.
+    # Must be checked BEFORE the normal per-keyword handlers below,
+    # since e.g. "var del x" starts with "var " and would otherwise
+    # be routed to handle_var and fail as invalid assignment syntax.
+    _DEL_PREFIXES = ("var del ", "list del ", "input del ")
+    for _pfx in _DEL_PREFIXES:
+        if line.startswith(_pfx):
+            _name = line[len(_pfx):].strip()
+            if not _name.isidentifier():
+                raise OptimizeError(f"Invalid name to delete: '{_name}'")
+            # For 'function del', also remove from the functions dict.
+            if line.startswith("function del ") and _name in functions:
+                del functions[_name]
+                return
+            scope.delete(_name)
+            return
+
     if line.startswith("display "): return handle_display(line[8:], scope)
     if line.startswith("var "):     return handle_var(line[4:], scope)
     if line.startswith("list "):    return handle_list(line[5:], scope)
@@ -677,6 +739,15 @@ def execute_block(lines: list, scope: Scope):
             idx = execute_for(lines, idx, scope)
         elif clean_for_check.startswith("while ("):
             idx = execute_while(lines, idx, scope)
+        elif clean_for_check.startswith("function del "):
+            # `function del <name>` — delete a registered function.
+            fname = clean_for_check[13:].strip()
+            if not fname.isidentifier():
+                raise OptimizeError(f"Invalid function name to delete: '{fname}'")
+            if fname not in functions:
+                raise OptimizeError(f"Cannot delete '{fname}': function is not defined.")
+            del functions[fname]
+            idx += 1
         elif clean_for_check.startswith("function "):
             idx = register_function(lines, idx)
         elif clean == "end":
