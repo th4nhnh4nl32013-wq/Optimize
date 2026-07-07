@@ -70,10 +70,11 @@
     <Variables/>
     <Commands>
       <Command type="Shell Execute" command="setx /M PATH &quot;%PATH%;&lt;InstallPath&gt;&quot;" commandLineArguments="" options=""/>
+      <Command type="Shell Execute" command="-Command &quot;[Environment]::SetEnvironmentVariable(&apos;PATH&apos;, [Environment]::GetEnvironmentVariable(&apos;PATH&apos;, &apos;Machine&apos;).Replace(&apos;&lt;InstallPath&gt;;&apos;, &apos;&apos;).Replace(&apos;&lt;InstallPath&gt;&apos;, &apos;&apos;), &apos;Machine&apos;)&quot;" commandLineArguments="" options=""/>
     </Commands>
     <Registry/>
     <Shortcuts defaultPath="&lt;Company&gt;\&lt;AppName&gt;\" isDefaultPathAlterable="false" isCreateStartmenuShortcutsForAllUsers="false" isCreateDesktopShortcutsForAllUsers="false">
-      <Shortcut destination="Startmenu" name="Optimize IDE" targetFile="&lt;InstallPath&gt;\C:\Users\Hi\OneDrive\Desktop\Optimize\ide.py" commandLineArguments="" iconFilePath="" iconIndex="0"/>
+      <Shortcut destination="Startmenu" name="Optimize IDE" targetFile="&lt;InstallPath&gt;C:\Users\Hi\OneDrive\Desktop\Optimize\dist\ide.exe" commandLineArguments="" iconFilePath="" iconIndex="0"/>
     </Shortcuts>
     <Serials isDialogEnabled="false" count="1000" mask ="#####-#####">
       <Serial>0DD87-BZW3Y</Serial>

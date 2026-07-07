@@ -2,6 +2,8 @@ import sys
 import os
 import importlib.util
 
+from package.readinout import open_file, read_lines, write_text
+
 # ─────────────────────────────────────────────
 #  Exceptions
 # ─────────────────────────────────────────────
@@ -27,7 +29,7 @@ global_vars  = {}
 functions    = {}
 loaded_libs  = set()
 lib_exports  = {}   # {lib_name: [list of symbol names it added to global_vars]}
-PACKAGE_DIR  = "package"
+PACKAGE_DIR  = os.path.join(os.path.dirname(__file__), "package")
 
 # ─────────────────────────────────────────────
 #  Scope object  (Lua-style local/global)
@@ -256,6 +258,23 @@ def _is_pure_string_literal(raw: str):
 def parse_value(raw: str, scope: Scope):
     raw = raw.strip()
 
+    if raw.startswith("format "):
+        body = raw[6:].strip()
+        if not body:
+            raise OptimizeError("format requires a string literal.")
+        if not ((body.startswith('"') and body.endswith('"')) or
+                (body.startswith("'") and body.endswith("'"))):
+            raise OptimizeError("fomat requires a quoted string literal.")
+        text = body[1:-1]
+
+        def _sub(match):
+            name = match.group(1)
+            if not scope.has(name):
+                raise OptimizeError(f"'{name}' is not defined.")
+            return str(scope.get(name))
+
+        return _re.sub(r"%([A-Za-z_][A-Za-z0-9_]*)%", _sub, text)
+
     if _is_pure_string_literal(raw):
         return raw[1:-1]
 
@@ -342,6 +361,52 @@ def handle_display(rest: str, scope: Scope):
         raise OptimizeError("display requires a value.")
     value = parse_value(rest, scope)
     print("True" if value is True else "False" if value is False else value)
+
+
+def handle_open(rest: str, scope: Scope):
+    rest = rest.strip()
+    if " as " not in rest:
+        raise OptimizeError("Invalid open syntax: 'open \"file\" as stdin/stdout'")
+    path_part, _, mode_part = rest.partition(" as ")
+    path = parse_value(path_part.strip(), scope)
+    if not isinstance(path, str):
+        raise OptimizeError("File path must be a string.")
+    mode = mode_part.strip().lower()
+    if mode not in ("stdin", "stdout"):
+        raise OptimizeError("open mode must be 'stdin' or 'stdout'.")
+    open_file(path, mode)
+
+
+def handle_read(rest: str, scope: Scope):
+    rest = rest.strip()
+    if not rest or rest == "-all":
+        count = None
+    else:
+        count = parse_value(rest, scope)
+        if isinstance(count, bool):
+            count = int(count)
+        elif isinstance(count, str):
+            if count == "-all":
+                count = None
+            else:
+                count = int(count)
+        else:
+            count = int(count)
+    data = read_lines(count)
+    if data:
+        write_text(data)
+    return data
+
+
+def handle_write(rest: str, scope: Scope):
+    rest = rest.strip()
+    if not rest:
+        raise OptimizeError("write requires a string value.")
+    value = parse_value(rest, scope)
+    if not isinstance(value, str):
+        value = str(value)
+    write_text(value)
+
 
 def handle_list(rest: str, scope: Scope):
     if "=" not in rest:
@@ -626,6 +691,9 @@ def dispatch(line: str, scope: Scope):
             scope.delete(_name)
             return
 
+    if line.startswith("open "):    return handle_open(line[5:], scope)
+    if line == "read" or line.startswith("read "): return handle_read(line[5:].strip(), scope)
+    if line.startswith("write "):   return handle_write(line[6:], scope)
     if line.startswith("display "): return handle_display(line[8:], scope)
     if line.startswith("var "):     return handle_var(line[4:], scope)
     if line.startswith("list "):    return handle_list(line[5:], scope)
