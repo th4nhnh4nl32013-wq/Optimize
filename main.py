@@ -1,6 +1,7 @@
 import sys
 import os
 import importlib.util
+import re as _re
 
 from package.readinout import open_file, read_lines, write_text
 
@@ -27,6 +28,7 @@ class StopException(Exception):   # break
 
 global_vars  = {}
 functions    = {}
+classes      = {}   # {class_name: OptClass}
 loaded_libs  = set()
 lib_exports  = {}   # {lib_name: [list of symbol names it added to global_vars]}
 PACKAGE_DIR  = os.path.join(os.path.dirname(__file__), "package")
@@ -81,6 +83,145 @@ class Scope:
         for frame in self.frames:
             merged.update(frame)
         return merged
+
+# ─────────────────────────────────────────────
+#  Class / instance objects  (Python-style classes)
+# ─────────────────────────────────────────────
+
+class OptClass:
+    """A user-defined `class Name` / `class Name (Parent)` block.
+    Holds its own methods (dict of name -> function-def dict, same
+    shape as entries in `functions`) plus an optional parent class
+    for method/attribute inheritance lookups."""
+    __slots__ = ("name", "methods", "parent")
+
+    def __init__(self, name, parent=None):
+        self.name = name
+        self.methods = {}
+        self.parent = parent
+
+    def find_method(self, mname):
+        cls = self
+        while cls is not None:
+            if mname in cls.methods:
+                return cls.methods[mname]
+            cls = cls.parent
+        return None
+
+    def is_subclass_of(self, other):
+        cls = self
+        while cls is not None:
+            if cls is other:
+                return True
+            cls = cls.parent
+        return False
+
+
+class OptInstance:
+    """A runtime instance of an OptClass. Attributes live in
+    `attrs`, a plain dict, set/read via `self.attr` inside methods
+    or `obj.attr` from outside."""
+    __slots__ = ("cls", "attrs")
+
+    def __init__(self, cls: OptClass):
+        self.cls = cls
+        self.attrs = {}
+
+    def get_attr(self, name):
+        if name in self.attrs:
+            return self.attrs[name]
+        method = self.cls.find_method(name)
+        if method is not None:
+            # Bound method: a callable that injects `self` as the
+            # first positional argument automatically.
+            return lambda *a, **kw: _call_method(self, method, list(a), kw)
+        raise OptimizeError(f"'{self.cls.name}' object has no attribute '{name}'.")
+
+    def has_attr(self, name):
+        if name in self.attrs:
+            return True
+        return self.cls.find_method(name) is not None
+
+    def set_attr(self, name, value):
+        self.attrs[name] = value
+
+    def __repr__(self):
+        return f"<{self.cls.name} object>"
+
+
+def _call_method(instance: "OptInstance", method: dict, arg_values: list, kwarg_values: dict):
+    """Invokes a resolved method dict (as stored in OptClass.methods)
+    on `instance`, automatically binding `self`."""
+    fn_scope = _bind_args_for_method(method, instance, arg_values, kwarg_values)
+    try:
+        execute_block(method["body"], fn_scope)
+    except ReturnException as r:
+        return r.value
+    return None
+
+
+def _bind_args_for_method(method: dict, instance: "OptInstance", positional: list, keywords: dict) -> "Scope":
+    params      = method["params"]
+    star_args   = method.get("star_args")
+    star_kwargs = method.get("star_kwargs")
+    if not params or params[0] != "self":
+        raise OptimizeError(
+            f"Method '{method.get('name', '?')}' must declare 'self' as its first parameter.")
+    fn_scope = Scope()
+    fn_scope.set_local("self", instance)
+
+    real_params = params[1:]
+    remaining_kw = dict(keywords)
+
+    for i, p in enumerate(real_params):
+        if i < len(positional):
+            fn_scope.set_local(p, positional[i])
+        elif p in remaining_kw:
+            fn_scope.set_local(p, remaining_kw.pop(p))
+        else:
+            raise OptimizeError(f"Method '{method.get('name','?')}' missing argument '{p}'.")
+
+    extra_positional = positional[len(real_params):]
+    if extra_positional and star_args is None:
+        raise OptimizeError(
+            f"Method expects {len(real_params)} positional argument(s), got {len(positional)}.")
+    if star_args is not None:
+        fn_scope.set_local(star_args, list(extra_positional))
+
+    if star_kwargs is not None:
+        fn_scope.set_local(star_kwargs, remaining_kw)
+    elif remaining_kw:
+        unexpected = ", ".join(remaining_kw.keys())
+        raise OptimizeError(f"Method got unexpected keyword argument(s): {unexpected}.")
+
+    return fn_scope
+
+
+def instantiate_class(cls: "OptClass", positional: list, keywords: dict) -> "OptInstance":
+    instance = OptInstance(cls)
+    init_method = cls.find_method("__init__")
+    if init_method is not None:
+        _call_method(instance, init_method, positional, keywords)
+    elif positional or keywords:
+        raise OptimizeError(
+            f"Class '{cls.name}' has no '__init__' but was given arguments.")
+    return instance
+
+
+_ATTR_ACCESS_PATTERN = _re.compile(r"^([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.([A-Za-z_][A-Za-z0-9_]*)$")
+
+def _split_attr_chain(text: str):
+    """For 'self.x' or 'a.b.c' (NOT a call, no trailing parens),
+    returns (root_expr, [attr1, attr2, ...]) or None if `text`
+    doesn't look like a plain dotted attribute chain."""
+    if "(" in text or ")" in text:
+        return None
+    parts = text.split(".")
+    if len(parts) < 2:
+        return None
+    if not all(p.isidentifier() for p in parts):
+        return None
+    return parts[0], parts[1:]
 
 # ─────────────────────────────────────────────
 #  Helpers
@@ -142,7 +283,7 @@ def safe_eval(expr: str, scope: Scope):
         # local variable happens to shadow a function name.
         for fname in functions:
             if fname not in merged:
-                merged[fname] = (lambda _n: lambda *a: call_function_with_values(_n, list(a)))(fname)
+                merged[fname] = (lambda _n: lambda *a, **kw: call_function_with_values(_n, list(a), kw))(fname)
         return eval(expr, {"__builtins__": {}}, merged)
     except ZeroDivisionError:
         raise OptimizeError("Division by zero.")
@@ -200,7 +341,15 @@ def extract_function_call(text: str):
         return None
     paren_idx = text.index("(")
     name = text[:paren_idx].strip()
-    if not name.isidentifier() or name in ("if", "for", "while", "function"):
+    # Allow dotted call targets too, e.g. 'self.greet()' or
+    # 'obj.method()' or 'ClassName()' - only the leading segment
+    # needs to be a bare identifier; the rest is dot-separated
+    # identifiers, checked again by the caller.
+    if not name:
+        return None
+    if not (name.isidentifier() or all(p.isidentifier() for p in name.split("."))):
+        return None
+    if name in ("if", "for", "while", "function", "class"):
         return None
 
     # Walk from paren_idx to confirm this '(' closes exactly at the
@@ -230,6 +379,96 @@ def extract_function_call(text: str):
 
     args = text[paren_idx+1:-1].strip()
     return (name, args)
+
+# ─────────────────────────────────────────────
+#  Function parameter / call-argument parsing
+#  (supports *args and **kargs, Python-style)
+# ─────────────────────────────────────────────
+
+def parse_params(param_str: str):
+    """Parses a function's parameter list, Python-style:
+       foo(a, b, *args, **kargs)
+       Fixed params must come first, then at most one *name,
+       then at most one **name."""
+    params, star_args, star_kwargs = [], None, None
+    for p in [x.strip() for x in param_str.split(",") if x.strip()]:
+        if p.startswith("**"):
+            name = p[2:].strip()
+            if not name.isidentifier():
+                raise OptimizeError(f"Invalid **kargs parameter: '{p}'")
+            if star_kwargs is not None:
+                raise OptimizeError("Only one **kargs parameter is allowed.")
+            star_kwargs = name
+        elif p.startswith("*"):
+            name = p[1:].strip()
+            if not name.isidentifier():
+                raise OptimizeError(f"Invalid *args parameter: '{p}'")
+            if star_kwargs is not None:
+                raise OptimizeError("*args must come before **kargs.")
+            if star_args is not None:
+                raise OptimizeError("Only one *args parameter is allowed.")
+            star_args = name
+        else:
+            if not p.isidentifier():
+                raise OptimizeError(f"Invalid parameter name: '{p}'")
+            if star_args is not None or star_kwargs is not None:
+                raise OptimizeError("Fixed parameters must come before *args/**kargs.")
+            params.append(p)
+    return params, star_args, star_kwargs
+
+_KWARG_PATTERN = _re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*(.*)$")
+
+def _parse_call_args(arg_str: str, scope: Scope):
+    """Splits a call's argument string into (positional_values, keyword_values),
+       supporting trailing name=value args a la Python: foo(1, 2, x=3, y=4)."""
+    positional, keywords, seen_kw = [], {}, False
+    if not arg_str.strip():
+        return positional, keywords
+    for raw in split_top_level(arg_str):
+        raw = raw.strip()
+        m = _KWARG_PATTERN.match(raw)
+        if m:
+            kname, kexpr = m.group(1), m.group(2)
+            if kname in keywords:
+                raise OptimizeError(f"Duplicate keyword argument '{kname}'.")
+            keywords[kname] = parse_value(kexpr.strip(), scope)
+            seen_kw = True
+        else:
+            if seen_kw:
+                raise OptimizeError("Positional arguments cannot follow keyword arguments.")
+            positional.append(parse_value(raw, scope))
+    return positional, keywords
+
+def _bind_args(name: str, positional: list, keywords: dict) -> "Scope":
+    fn = functions[name]
+    params      = fn["params"]
+    star_args   = fn.get("star_args")
+    star_kwargs = fn.get("star_kwargs")
+    fn_scope = Scope()
+    remaining_kw = dict(keywords)
+
+    for i, p in enumerate(params):
+        if i < len(positional):
+            fn_scope.set_local(p, positional[i])
+        elif p in remaining_kw:
+            fn_scope.set_local(p, remaining_kw.pop(p))
+        else:
+            raise OptimizeError(f"Function '{name}' missing argument '{p}'.")
+
+    extra_positional = positional[len(params):]
+    if extra_positional and star_args is None:
+        raise OptimizeError(
+            f"Function '{name}' expects {len(params)} positional argument(s), got {len(positional)}.")
+    if star_args is not None:
+        fn_scope.set_local(star_args, list(extra_positional))
+
+    if star_kwargs is not None:
+        fn_scope.set_local(star_kwargs, remaining_kw)
+    elif remaining_kw:
+        unexpected = ", ".join(remaining_kw.keys())
+        raise OptimizeError(f"Function '{name}' got unexpected keyword argument(s): {unexpected}.")
+
+    return fn_scope
 
 # ─────────────────────────────────────────────
 #  Value parser
@@ -290,6 +529,35 @@ def parse_value(raw: str, scope: Scope):
     if call_info:
         fname, args = call_info
 
+        # Class instantiation: ClassName(...)
+        if fname in classes and not scope.has(fname):
+            positional, keywords = _parse_call_args(args, scope)
+            return instantiate_class(classes[fname], positional, keywords)
+
+        # Dotted call: self.method(...) / obj.method(...) / a.b.method(...)
+        if "." in fname:
+            target_expr, _, mname = fname.rpartition(".")
+            target = parse_value(target_expr, scope)
+            if isinstance(target, OptInstance):
+                method = target.cls.find_method(mname)
+                if method is None:
+                    raise OptimizeError(
+                        f"'{target.cls.name}' object has no method '{mname}'.")
+                positional, keywords = _parse_call_args(args, scope)
+                return _call_method(target, method, positional, keywords)
+            # Not an OptInstance: fall through to generic handling below
+            # (e.g. calling a bound Python method on some other object).
+            attr_fn = getattr(target, mname, None) if not isinstance(target, (dict, list)) else None
+            if callable(attr_fn):
+                positional, keywords = _parse_call_args(args, scope)
+                try:
+                    return attr_fn(*positional, **keywords)
+                except OptimizeError:
+                    raise
+                except Exception as e:
+                    raise OptimizeError(f"{fname}(): {e}")
+            raise OptimizeError(f"'{fname}' is not callable.")
+
         # Optimize function
         if fname in functions:
             return call_function(fname, args, scope)
@@ -300,19 +568,40 @@ def parse_value(raw: str, scope: Scope):
 
             if callable(fn):
                 arg_values = []
+                kwarg_values = {}
 
                 if args.strip():
                     for arg in split_top_level(args):
-                        arg_values.append(
-                            parse_value(arg.strip(), scope)
-                        )
+                        arg = arg.strip()
+                        m = _KWARG_PATTERN.match(arg)
+                        if m:
+                            kwarg_values[m.group(1)] = parse_value(m.group(2).strip(), scope)
+                        else:
+                            arg_values.append(parse_value(arg, scope))
 
                 try:
-                    return fn(*arg_values)
+                    return fn(*arg_values, **kwarg_values)
                 except OptimizeError:
                     raise
                 except Exception as e:
                     raise OptimizeError(f"{fname}(): {e}")
+
+    # Plain attribute access: self.x / obj.x / a.b.c  (no call parens)
+    attr_chain = _split_attr_chain(raw)
+    if attr_chain:
+        root_name, attrs = attr_chain
+        if scope.has(root_name):
+            value = scope.get(root_name)
+            for a in attrs:
+                if isinstance(value, OptInstance):
+                    value = value.get_attr(a)
+                elif isinstance(value, dict):
+                    if a not in value:
+                        raise OptimizeError(f"'{a}' not found.")
+                    value = value[a]
+                else:
+                    raise OptimizeError(f"Cannot access '.{a}' on non-object value.")
+            return value
 
     try:
         return int(raw)
@@ -332,11 +621,46 @@ def parse_value(raw: str, scope: Scope):
 #  Assignment: local / global / bare
 # ─────────────────────────────────────────────
 
-def assign(name: str, expr: str, scope: Scope, kind: str):
+_UNSET = object()
+
+def assign(name: str, expr: str, scope: Scope, kind: str, precomputed=_UNSET):
+    """Assigns `expr` (parsed via parse_value) to `name`, unless
+    `precomputed` is given, in which case that value is used as-is
+    (used by compound assignment on attribute targets, where the
+    right-hand side is already a Python value, not Optimize source)."""
     name = name.strip()
+
+    # Attribute assignment: self.attr = value / obj.attr = value / a.b.c = value
+    if "." in name:
+        attr_chain = _split_attr_chain(name)
+        if not attr_chain:
+            raise OptimizeError(f"Invalid assignment target: '{name}'")
+        root_name, attrs = attr_chain
+        if not scope.has(root_name):
+            raise OptimizeError(f"'{root_name}' is not defined.")
+        target = scope.get(root_name)
+        for a in attrs[:-1]:
+            if isinstance(target, OptInstance):
+                target = target.get_attr(a)
+            elif isinstance(target, dict):
+                if a not in target:
+                    raise OptimizeError(f"'{a}' not found.")
+                target = target[a]
+            else:
+                raise OptimizeError(f"Cannot access '.{a}' on non-object value.")
+        value = precomputed if precomputed is not _UNSET else parse_value(expr.strip(), scope)
+        last = attrs[-1]
+        if isinstance(target, OptInstance):
+            target.set_attr(last, value)
+        elif isinstance(target, dict):
+            target[last] = value
+        else:
+            raise OptimizeError(f"Cannot set attribute '.{last}' on non-object value.")
+        return value
+
     if not name.isidentifier():
         raise OptimizeError(f"Invalid variable name: '{name}'")
-    value = parse_value(expr.strip(), scope)
+    value = precomputed if precomputed is not _UNSET else parse_value(expr.strip(), scope)
     if kind == "local":
         scope.set_local(name, value)
     elif kind == "global":
@@ -534,7 +858,7 @@ def _auto_cast(s: str):
 def handle_type(rest: str, scope: Scope):
     val = parse_value(rest.strip(), scope)
     for t, name in [(bool, "Boolean"), (int, "Integer"), (float, "Float"),
-                    (list, "List"), (str, "String")]:
+                    (list, "List"), (dict, "Dictionary"), (str, "String")]:
         if isinstance(val, t):
             print(name); return
     print("Unknown")
@@ -619,40 +943,25 @@ def handle_library(rest: str, scope: Scope):
 def call_function(name: str, arg_str: str, scope: Scope):
     if name not in functions:
         raise OptimizeError(f"Function '{name}' is not defined.")
-    fn     = functions[name]
-    params = fn["params"]
-    body   = fn["body"]
-    raw_args = [a.strip() for a in arg_str.split(",")] if arg_str.strip() else []
-    if len(raw_args) != len(params):
-        raise OptimizeError(
-            f"Function '{name}' expects {len(params)} argument(s), got {len(raw_args)}.")
-    fn_scope = Scope()
-    for param, raw in zip(params, raw_args):
-        fn_scope.set_local(param, parse_value(raw, scope))
+    positional, keywords = _parse_call_args(arg_str, scope)
+    fn_scope = _bind_args(name, positional, keywords)
     try:
-        execute_block(body, fn_scope)
+        execute_block(functions[name]["body"], fn_scope)
     except ReturnException as r:
         return r.value
     return None
 
-def call_function_with_values(name: str, arg_values):
+def call_function_with_values(name: str, arg_values, kwarg_values=None):
     """Like call_function, but takes already-evaluated Python values
     instead of raw argument strings. Used so Optimize-defined
     'function's can be called from inside a larger expression that
-    goes through safe_eval()/Python's eval(), e.g. 'add(1,2) + 3'."""
+    goes through safe_eval()/Python's eval(), e.g. 'add(1,2) + 3',
+    and now also supports keyword arguments, e.g. 'greet(x, y=2)'."""
     if name not in functions:
         raise OptimizeError(f"Function '{name}' is not defined.")
-    fn     = functions[name]
-    params = fn["params"]
-    body   = fn["body"]
-    if len(arg_values) != len(params):
-        raise OptimizeError(
-            f"Function '{name}' expects {len(params)} argument(s), got {len(arg_values)}.")
-    fn_scope = Scope()
-    for param, val in zip(params, arg_values):
-        fn_scope.set_local(param, val)
+    fn_scope = _bind_args(name, list(arg_values), dict(kwarg_values or {}))
     try:
-        execute_block(body, fn_scope)
+        execute_block(functions[name]["body"], fn_scope)
     except ReturnException as r:
         return r.value
     return None
@@ -704,10 +1013,40 @@ def dispatch(line: str, scope: Scope):
     if line.startswith("library "): return handle_library(line[8:], scope)
     if line.startswith("return"):   return handle_return(line[6:], scope)
 
-    # Function call as standalone statement: funcname(...)
+    # Function / method call / instantiation as standalone statement:
+    # funcname(...), self.method(...), obj.method(...), ClassName(...)
     call_info = extract_function_call(line)
     if call_info:
         fname, args = call_info
+
+        if fname in classes and not scope.has(fname):
+            positional, keywords = _parse_call_args(args, scope)
+            instantiate_class(classes[fname], positional, keywords)
+            return
+
+        if "." in fname:
+            target_expr, _, mname = fname.rpartition(".")
+            target = parse_value(target_expr, scope)
+            if isinstance(target, OptInstance):
+                method = target.cls.find_method(mname)
+                if method is None:
+                    raise OptimizeError(
+                        f"'{target.cls.name}' object has no method '{mname}'.")
+                positional, keywords = _parse_call_args(args, scope)
+                _call_method(target, method, positional, keywords)
+                return
+            attr_fn = getattr(target, mname, None) if not isinstance(target, (dict, list)) else None
+            if callable(attr_fn):
+                positional, keywords = _parse_call_args(args, scope)
+                try:
+                    attr_fn(*positional, **keywords)
+                except OptimizeError:
+                    raise
+                except Exception as e:
+                    raise OptimizeError(f"{fname}(): {e}")
+                return
+            raise OptimizeError(f"'{fname}' is not callable.")
+
         if fname in functions:
             call_function(fname, args, scope)
             return
@@ -719,18 +1058,24 @@ def dispatch(line: str, scope: Scope):
             fn = scope.get(fname)
             if callable(fn):
                 arg_values = []
+                kwarg_values = {}
                 if args.strip():
                     for arg in split_top_level(args):
-                        arg_values.append(parse_value(arg.strip(), scope))
+                        arg = arg.strip()
+                        m = _KWARG_PATTERN.match(arg)
+                        if m:
+                            kwarg_values[m.group(1)] = parse_value(m.group(2).strip(), scope)
+                        else:
+                            arg_values.append(parse_value(arg, scope))
                 try:
-                    fn(*arg_values)
+                    fn(*arg_values, **kwarg_values)
                 except OptimizeError:
                     raise
                 except Exception as e:
                     raise OptimizeError(f"{fname}(): {e}")
                 return
 
-    # Compound assignment: i += 1, i -= 1, etc.
+    # Compound assignment: i += 1, i -= 1, self.x += 1, etc.
     for cop in ("+=", "-=", "*=", "/="):
         if cop in line:
             name, _, expr = line.partition(cop)
@@ -742,12 +1087,19 @@ def dispatch(line: str, scope: Scope):
                            "*=": current * delta, "/=": current / delta}[cop]
                 scope.set_auto(name, result)
                 return
+            if "." in name and _split_attr_chain(name):
+                current = parse_value(name, scope)
+                delta   = safe_eval(expr.strip(), scope)
+                result  = {"+=": current + delta, "-=": current - delta,
+                           "*=": current * delta, "/=": current / delta}[cop]
+                assign(name, repr(result) if isinstance(result, str) else str(result), scope, "auto")
+                return
 
-    # Bare assignment: x = value
+    # Bare assignment: x = value, self.attr = value, obj.attr = value
     if "=" in line:
         name, _, expr = line.partition("=")
         name = name.strip()
-        if name.isidentifier():
+        if name.isidentifier() or (( "." in name) and _split_attr_chain(name)):
             assign(name, expr, scope, "auto")
             return
 
@@ -766,7 +1118,8 @@ def collect_block(lines: list, start: int):
             body.append(raw); idx += 1; continue
         clean = _strip_comment(stripped)
 
-        if any(clean.startswith(s) for s in ("if (", "for (", "while (", "function ")):
+        # ADDED "class " to the tracking tuple here
+        if any(clean.startswith(s) for s in ("if (", "for (", "while (", "function ", "class ")):
             depth += 1; body.append(raw); idx += 1
         elif clean == "end":
             if depth == 0:
@@ -777,7 +1130,6 @@ def collect_block(lines: list, start: int):
         else:
             body.append(raw); idx += 1
     return body, idx
-
 def _clean(lines, idx):
     return _strip_comment(lines[idx].strip())
 
@@ -796,7 +1148,6 @@ def execute_block(lines: list, scope: Scope):
         if not clean:
             idx += 1; continue
 
-        # Check for optional trailing colon and remove it for keyword matching
         clean_for_check = clean.rstrip()
         if clean_for_check.endswith(':'):
             clean_for_check = clean_for_check[:-1].rstrip()
@@ -808,7 +1159,6 @@ def execute_block(lines: list, scope: Scope):
         elif clean_for_check.startswith("while ("):
             idx = execute_while(lines, idx, scope)
         elif clean_for_check.startswith("function del "):
-            # `function del <name>` — delete a registered function.
             fname = clean_for_check[13:].strip()
             if not fname.isidentifier():
                 raise OptimizeError(f"Invalid function name to delete: '{fname}'")
@@ -818,12 +1168,14 @@ def execute_block(lines: list, scope: Scope):
             idx += 1
         elif clean_for_check.startswith("function "):
             idx = register_function(lines, idx)
+        # ADDED: Handle class declarations
+        elif clean_for_check.startswith("class "):
+            idx = register_class(lines, idx)
         elif clean == "end":
             idx += 1
         else:
             dispatch(clean, scope)
             idx += 1
-
 # ── if ───────────────────────────────────────
 
 def execute_if(lines: list, start: int, scope: Scope) -> int:
@@ -985,17 +1337,96 @@ def register_function(lines: list, start: int) -> int:
     if "(" not in rest or not rest.endswith(")"):
         raise OptimizeError(f"Invalid function syntax: 'function {rest}'")
     fname  = rest[:rest.index("(")].strip()
-    params = [p.strip() for p in rest[rest.index("(")+1:-1].split(",") if p.strip()]
+    params, star_args, star_kwargs = parse_params(rest[rest.index("(")+1:-1])
     body, idx = collect_block(lines, idx)
     if idx >= len(lines) or _clean(lines, idx) != "end":
         raise OptimizeError(f"Expected 'end' after function '{fname}'")
     idx += 1
-    functions[fname] = {"params": params, "body": body}
+    functions[fname] = {
+        "params": params,
+        "star_args": star_args,
+        "star_kwargs": star_kwargs,
+        "body": body,
+    }
     return idx
 
 # ─────────────────────────────────────────────
 #  Entry point
 # ─────────────────────────────────────────────
+def register_class(lines: list, start: int) -> int:
+    idx   = start
+    clean = strip_trailing_colon(_clean(lines, idx))
+    rest  = clean[5:].strip()  # Strip 'class'
+    idx  += 1
+
+    parent = None
+    # Support python-style inheritance: class Child(Parent)
+    if "(" in rest:
+        if not rest.endswith(")"):
+            raise OptimizeError(f"Invalid class syntax: 'class {rest}'")
+        cname = rest[:rest.index("(")].strip()
+        pname = rest[rest.index("(")+1:-1].strip()
+        if pname:
+            if pname not in classes:
+                raise OptimizeError(f"Parent class '{pname}' is not defined.")
+            parent = classes[pname]
+    else:
+        cname = rest
+
+    if not cname.isidentifier():
+        raise OptimizeError(f"Invalid class name: '{cname}'")
+
+    body, idx = collect_block(lines, idx)
+    if idx >= len(lines) or _clean(lines, idx) != "end":
+        raise OptimizeError(f"Expected 'end' after class '{cname}'")
+    idx += 1
+
+    cls = OptClass(cname, parent)
+
+    # Parse methods out of the class block body
+    b_idx = 0
+    while b_idx < len(body):
+        b_raw = body[b_idx].rstrip()
+        b_stripped = b_raw.strip()
+        if not b_stripped or b_stripped.startswith("!"):
+            b_idx += 1
+            continue
+        b_clean = _strip_comment(b_stripped)
+        if not b_clean:
+            b_idx += 1
+            continue
+
+        b_clean_check = b_clean.rstrip()
+        if b_clean_check.endswith(':'):
+            b_clean_check = b_clean_check[:-1].rstrip()
+
+        if b_clean_check.startswith("function "):
+            f_rest = b_clean_check[9:].strip()
+            if "(" not in f_rest or not f_rest.endswith(")"):
+                raise OptimizeError(f"Invalid method syntax: 'function {f_rest}'")
+            mname = f_rest[:f_rest.index("(")].strip()
+            params, star_args, star_kwargs = parse_params(f_rest[f_rest.index("(")+1:-1])
+            
+            b_idx += 1
+            f_body, b_idx = collect_block(body, b_idx)
+            if b_idx >= len(body) or _clean(body, b_idx) != "end":
+                raise OptimizeError(f"Expected 'end' after method '{mname}'")
+            b_idx += 1
+
+            cls.methods[mname] = {
+                "name": mname,
+                "params": params,
+                "star_args": star_args,
+                "star_kwargs": star_kwargs,
+                "body": f_body,
+            }
+        elif b_clean == "end":
+            b_idx += 1
+        else:
+            raise OptimizeError(f"Only methods ('function') are allowed directly inside a class body. Got: '{b_clean}'")
+
+    classes[cname] = cls
+    return idx
 
 def run(filepath: str):
     try:
