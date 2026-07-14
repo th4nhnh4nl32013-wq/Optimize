@@ -20,7 +20,6 @@ optstr - string helper module for Optimize
     display is_alpha("abc")
 """
 
-
 def upper(s):
     return str(s).upper()
 
@@ -97,3 +96,13 @@ def to_upper_first(s):
 
 def capitalize(s):
     return str(s).capitalize()
+
+def _register_optstr_input_types():
+    import main as _opt
+    for t in ("str", "string"):
+        if t not in _opt.VALID_INPUT_TYPES:
+            _opt.VALID_INPUT_TYPES = _opt.VALID_INPUT_TYPES + (t,)
+    _opt.RESERVED_INPUT_TYPE_WORDS -= {"str", "string"}
+    _opt.STRING_DECL_KEYWORDS.add("string")
+
+_register_optstr_input_types()

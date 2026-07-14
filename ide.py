@@ -85,6 +85,6 @@ def repl():
             pass
 
 if __name__ == "__main__":
-    print("Optimize CMD v0.1")
+    print("Optimize CMD v0.4")
     print("----------------------------------------")
     repl()

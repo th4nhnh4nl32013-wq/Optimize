@@ -32,6 +32,13 @@ classes      = {}   # {class_name: OptClass}
 loaded_libs  = set()
 lib_exports  = {}   # {lib_name: [list of symbol names it added to global_vars]}
 PACKAGE_DIR  = os.path.join(os.path.dirname(__file__), "package")
+OUTPUT_BUFFER = []
+_BL_SUFFIX_PATTERN = _re.compile(r'\s+bl$')
+STANDARD_LIB_MODULES = ("optmath", "algorithm", "optrand", "optstr", "opttime")
+VALID_INPUT_TYPES = ("int", "float", "bool", "list")
+RESERVED_INPUT_TYPE_WORDS = {"str", "string"}
+STRING_DECL_KEYWORDS = set()
+LIB_UNLOAD_HOOKS = {}
 
 # ─────────────────────────────────────────────
 #  Scope object  (Lua-style local/global)
@@ -89,10 +96,6 @@ class Scope:
 # ─────────────────────────────────────────────
 
 class OptClass:
-    """A user-defined `class Name` / `class Name (Parent)` block.
-    Holds its own methods (dict of name -> function-def dict, same
-    shape as entries in `functions`) plus an optional parent class
-    for method/attribute inheritance lookups."""
     __slots__ = ("name", "methods", "parent")
 
     def __init__(self, name, parent=None):
@@ -118,9 +121,6 @@ class OptClass:
 
 
 class OptInstance:
-    """A runtime instance of an OptClass. Attributes live in
-    `attrs`, a plain dict, set/read via `self.attr` inside methods
-    or `obj.attr` from outside."""
     __slots__ = ("cls", "attrs")
 
     def __init__(self, cls: OptClass):
@@ -132,8 +132,6 @@ class OptInstance:
             return self.attrs[name]
         method = self.cls.find_method(name)
         if method is not None:
-            # Bound method: a callable that injects `self` as the
-            # first positional argument automatically.
             return lambda *a, **kw: _call_method(self, method, list(a), kw)
         raise OptimizeError(f"'{self.cls.name}' object has no attribute '{name}'.")
 
@@ -148,10 +146,19 @@ class OptInstance:
     def __repr__(self):
         return f"<{self.cls.name} object>"
 
+def flush_buffer():
+    if OUTPUT_BUFFER:
+        sys.stdout.write("".join(OUTPUT_BUFFER))
+        OUTPUT_BUFFER.clear()
+
+def JIT_display(*args):
+    # Joins items together and caches them instead of direct heavy printing
+    msg = " ".join(str(x) for x in args) + "\n"
+    OUTPUT_BUFFER.append(msg)
+    if len(OUTPUT_BUFFER) > 20000:  # Periodically flush large chunks
+        flush_buffer()
 
 def _call_method(instance: "OptInstance", method: dict, arg_values: list, kwarg_values: dict):
-    """Invokes a resolved method dict (as stored in OptClass.methods)
-    on `instance`, automatically binding `self`."""
     fn_scope = _bind_args_for_method(method, instance, arg_values, kwarg_values)
     try:
         execute_block(method["body"], fn_scope)
@@ -211,9 +218,6 @@ def instantiate_class(cls: "OptClass", positional: list, keywords: dict) -> "Opt
 _ATTR_ACCESS_PATTERN = _re.compile(r"^([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.([A-Za-z_][A-Za-z0-9_]*)$")
 
 def _split_attr_chain(text: str):
-    """For 'self.x' or 'a.b.c' (NOT a call, no trailing parens),
-    returns (root_expr, [attr1, attr2, ...]) or None if `text`
-    doesn't look like a plain dotted attribute chain."""
     if "(" in text or ")" in text:
         return None
     parts = text.split(".")
@@ -223,8 +227,16 @@ def _split_attr_chain(text: str):
         return None
     return parts[0], parts[1:]
 
+
+def _resolve_start_end_call(target, method_name):
+    if method_name == "start" and isinstance(target, (list, tuple, str, dict)):
+        return 0
+    if method_name == "end" and isinstance(target, (list, tuple, str, dict)):
+        return len(target)
+    return None
+
 # ─────────────────────────────────────────────
-#  Helpers
+#  Helpers & Caching Engine
 # ─────────────────────────────────────────────
 
 SAFE_BUILTINS = {
@@ -232,10 +244,10 @@ SAFE_BUILTINS = {
     "len": len, "int": int, "float": float,
     "str": str, "abs": abs, "round": round,
     "min": min, "max": max, "sum": sum,
-    # reversed() normally returns a lazy iterator; wrap it so
-    # 'display reversed(a)' and further indexing both just work.
     "reversed": lambda seq: list(reversed(seq)),
 }
+
+_COMPILE_CACHE = {}
 
 def _strip_comment(line: str) -> str:
     in_str = None
@@ -248,25 +260,12 @@ def _strip_comment(line: str) -> str:
             return line[:i].strip()
     return line.strip()
 
-import re as _re
-
 def _replace_last_item(expr: str) -> str:
-    # `a[last_item]` means "the last element of a" -> a[-1].
-    # Rewritten textually so 'last_item' never needs to be a real
-    # bound name (it has no meaning outside of a [...] index).
     return expr.replace("[last_item]", "[-1]")
 
 _START_END_PATTERN = _re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.(start|end)\(\)")
 
 def _replace_start_end(expr: str) -> str:
-    # `a.start()` -> 0          (first valid index)
-    # `a.end()`   -> len(a)     (one past the last index, exclusive,
-    #                            matching the algorithm module's
-    #                            (begin, end) convention)
-    # Rewritten textually per-match so each occurrence uses ITS OWN
-    # variable name, e.g. 'sort(a.start(), a.end())' becomes
-    # 'sort(0, len(a))', and a second list 'b.end()' independently
-    # becomes 'len(b)'.
     def _sub(m):
         name, which = m.group(1), m.group(2)
         return "0" if which == "start" else f"len({name})"
@@ -277,14 +276,15 @@ def safe_eval(expr: str, scope: Scope):
     expr = _replace_start_end(expr)
     try:
         merged = {**SAFE_BUILTINS, **scope.as_dict()}
-        # Make Optimize-defined `function`s callable from inside a
-        # larger expression too (e.g. 'add(1, 2) + 3'), not just as
-        # a bare standalone call. Scope-bound names still win if a
-        # local variable happens to shadow a function name.
         for fname in functions:
             if fname not in merged:
                 merged[fname] = (lambda _n: lambda *a, **kw: call_function_with_values(_n, list(a), kw))(fname)
-        return eval(expr, {"__builtins__": {}}, merged)
+        
+        # Bytecode compilation caching bypasses parsing overhead completely
+        if expr not in _COMPILE_CACHE:
+            _COMPILE_CACHE[expr] = compile(expr, "<string>", "eval")
+            
+        return eval(_COMPILE_CACHE[expr], {"__builtins__": {}}, merged)
     except ZeroDivisionError:
         raise OptimizeError("Division by zero.")
     except OptimizeError:
@@ -328,23 +328,11 @@ def split_top_level(inner: str) -> list:
     return parts
 
 def extract_function_call(text: str):
-    """
-    If text is exactly 'funcname(...)' - i.e. the FIRST '(' is
-    balanced by the LAST ')' with nothing trailing after it - return
-    (funcname, args_string). Otherwise return None.
-
-    This rules out things like 'f(x) + g(y)' or 'f(x) / 2', which
-    end with ')' and contain '(' but are NOT a single bare call.
-    """
     text = text.strip()
     if "(" not in text or not text.endswith(")"):
         return None
     paren_idx = text.index("(")
     name = text[:paren_idx].strip()
-    # Allow dotted call targets too, e.g. 'self.greet()' or
-    # 'obj.method()' or 'ClassName()' - only the leading segment
-    # needs to be a bare identifier; the rest is dot-separated
-    # identifiers, checked again by the caller.
     if not name:
         return None
     if not (name.isidentifier() or all(p.isidentifier() for p in name.split("."))):
@@ -352,9 +340,6 @@ def extract_function_call(text: str):
     if name in ("if", "for", "while", "function", "class"):
         return None
 
-    # Walk from paren_idx to confirm this '(' closes exactly at the
-    # final character, with quote-awareness so parens inside string
-    # literals don't throw off the depth count.
     depth = 0
     in_str = None
     for i in range(paren_idx, len(text)):
@@ -370,7 +355,6 @@ def extract_function_call(text: str):
         elif ch == ")":
             depth -= 1
             if depth == 0:
-                # The matching close-paren must be the LAST character.
                 if i != len(text) - 1:
                     return None
                 break
@@ -381,15 +365,34 @@ def extract_function_call(text: str):
     return (name, args)
 
 # ─────────────────────────────────────────────
+#  Pre-Parsed Statement Cache (The Speed Boost)
+# ─────────────────────────────────────────────
+
+def pre_parse_block(lines: list) -> list:
+    """Pre-parses raw text blocks into opcode tuples so loops run at native speed."""
+    parsed_statements = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("!"):
+            continue
+        clean = _strip_comment(stripped)
+        if not clean:
+            continue
+        
+        # Cache standard dispatch tokens
+        parsed_statements.append(clean)
+    return parsed_statements
+
+def execute_parsed_block(parsed_commands: list, scope: Scope):
+    """Executes pre-parsed commands sequentially without text overhead."""
+    for command in parsed_commands:
+        dispatch(command, scope)
+
+# ─────────────────────────────────────────────
 #  Function parameter / call-argument parsing
-#  (supports *args and **kargs, Python-style)
 # ─────────────────────────────────────────────
 
 def parse_params(param_str: str):
-    """Parses a function's parameter list, Python-style:
-       foo(a, b, *args, **kargs)
-       Fixed params must come first, then at most one *name,
-       then at most one **name."""
     params, star_args, star_kwargs = [], None, None
     for p in [x.strip() for x in param_str.split(",") if x.strip()]:
         if p.startswith("**"):
@@ -419,8 +422,6 @@ def parse_params(param_str: str):
 _KWARG_PATTERN = _re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)\s*=(?!=)\s*(.*)$")
 
 def _parse_call_args(arg_str: str, scope: Scope):
-    """Splits a call's argument string into (positional_values, keyword_values),
-       supporting trailing name=value args a la Python: foo(1, 2, x=3, y=4)."""
     positional, keywords, seen_kw = [], {}, False
     if not arg_str.strip():
         return positional, keywords
@@ -470,15 +471,20 @@ def _bind_args(name: str, positional: list, keywords: dict) -> "Scope":
 
     return fn_scope
 
+def _unregister_optstr():
+    STRING_DECL_KEYWORDS.discard("string")
+    global VALID_INPUT_TYPES
+    VALID_INPUT_TYPES = tuple(t for t in VALID_INPUT_TYPES if t not in ("str", "string"))
+    RESERVED_INPUT_TYPE_WORDS.add("str")
+    RESERVED_INPUT_TYPE_WORDS.add("string")
+
+LIB_UNLOAD_HOOKS["optstr"] = _unregister_optstr
+
 # ─────────────────────────────────────────────
 #  Value parser
 # ─────────────────────────────────────────────
 
 def _is_pure_string_literal(raw: str):
-    """Returns True only if `raw` is ENTIRELY one quoted string
-    literal with nothing else around it - e.g. '"hi"' is, but
-    '"hi" + x' merely starts and ends with a quote character and is
-    NOT a pure literal (it's a concatenation expression)."""
     if len(raw) < 2:
         return False
     quote = raw[0]
@@ -486,9 +492,6 @@ def _is_pure_string_literal(raw: str):
         return False
     if raw[-1] != quote:
         return False
-    # Walk the inside; if the same quote character appears again
-    # before the final character, the "literal" actually ends
-    # earlier and there's more content after it (so it's not pure).
     for ch in raw[1:-1]:
         if ch == quote:
             return False
@@ -523,21 +526,21 @@ def parse_value(raw: str, scope: Scope):
     if raw == "False":
         return False
 
-    # Function call
     call_info = extract_function_call(raw)
 
     if call_info:
         fname, args = call_info
 
-        # Class instantiation: ClassName(...)
         if fname in classes and not scope.has(fname):
             positional, keywords = _parse_call_args(args, scope)
             return instantiate_class(classes[fname], positional, keywords)
 
-        # Dotted call: self.method(...) / obj.method(...) / a.b.method(...)
         if "." in fname:
             target_expr, _, mname = fname.rpartition(".")
             target = parse_value(target_expr, scope)
+            special_value = _resolve_start_end_call(target, mname)
+            if special_value is not None:
+                return special_value
             if isinstance(target, OptInstance):
                 method = target.cls.find_method(mname)
                 if method is None:
@@ -545,8 +548,6 @@ def parse_value(raw: str, scope: Scope):
                         f"'{target.cls.name}' object has no method '{mname}'.")
                 positional, keywords = _parse_call_args(args, scope)
                 return _call_method(target, method, positional, keywords)
-            # Not an OptInstance: fall through to generic handling below
-            # (e.g. calling a bound Python method on some other object).
             attr_fn = getattr(target, mname, None) if not isinstance(target, (dict, list)) else None
             if callable(attr_fn):
                 positional, keywords = _parse_call_args(args, scope)
@@ -558,11 +559,9 @@ def parse_value(raw: str, scope: Scope):
                     raise OptimizeError(f"{fname}(): {e}")
             raise OptimizeError(f"'{fname}' is not callable.")
 
-        # Optimize function
         if fname in functions:
             return call_function(fname, args, scope)
 
-        # Python function
         if scope.has(fname):
             fn = scope.get(fname)
 
@@ -586,7 +585,6 @@ def parse_value(raw: str, scope: Scope):
                 except Exception as e:
                     raise OptimizeError(f"{fname}(): {e}")
 
-    # Plain attribute access: self.x / obj.x / a.b.c  (no call parens)
     attr_chain = _split_attr_chain(raw)
     if attr_chain:
         root_name, attrs = attr_chain
@@ -617,20 +615,16 @@ def parse_value(raw: str, scope: Scope):
         return safe_eval(raw, scope)
 
     return safe_eval(raw, scope)
+
 # ─────────────────────────────────────────────
-#  Assignment: local / global / bare
+#  Assignment
 # ─────────────────────────────────────────────
 
 _UNSET = object()
 
 def assign(name: str, expr: str, scope: Scope, kind: str, precomputed=_UNSET):
-    """Assigns `expr` (parsed via parse_value) to `name`, unless
-    `precomputed` is given, in which case that value is used as-is
-    (used by compound assignment on attribute targets, where the
-    right-hand side is already a Python value, not Optimize source)."""
     name = name.strip()
 
-    # Attribute assignment: self.attr = value / obj.attr = value / a.b.c = value
     if "." in name:
         attr_chain = _split_attr_chain(name)
         if not attr_chain:
@@ -676,15 +670,25 @@ def handle_var(rest: str, scope: Scope):
     assign(name, expr, scope, "auto")
 
 # ─────────────────────────────────────────────
-#  Statements: display / list / add / del / input / type / return
+#  Statements dispatchers
 # ─────────────────────────────────────────────
 
 def handle_display(rest: str, scope: Scope):
     rest = rest.strip()
     if not rest:
         raise OptimizeError("display requires a value.")
+
+    breakline = False
+    m = _BL_SUFFIX_PATTERN.search(rest)
+    if m:
+        breakline = True
+        rest = rest[:m.start()].strip()
+        if not rest:
+            raise OptimizeError("display requires a value.")
+
     value = parse_value(rest, scope)
-    print("True" if value is True else "False" if value is False else value)
+    text = "True" if value is True else "False" if value is False else str(value)
+    print(text, end="\n" if breakline else "", flush=True)
 
 
 def handle_open(rest: str, scope: Scope):
@@ -787,9 +791,11 @@ def handle_input(rest: str, scope: Scope):
 
     parts = rest.split(None, 2)
 
-    # Syntax is: input {type_of_var} {var_name} ["prompt"]
-    # If the first word isn't a recognized type, there's no type
-    # given at all, and the value stays as a plain string.
+    if parts[0] in RESERVED_INPUT_TYPE_WORDS and parts[0] not in VALID_INPUT_TYPES:
+        raise OptimizeError(
+            f"input type '{parts[0]}' requires 'library optstr' to be loaded."
+        )
+
     if parts[0] in VALID_INPUT_TYPES:
         type_hint = parts[0]
         if len(parts) < 2:
@@ -801,7 +807,7 @@ def handle_input(rest: str, scope: Scope):
         var_name = parts[0]
         prompt_part = parts[1] if len(parts) >= 2 else ""
 
-    prompt = f"{var_name}: "
+    prompt = ""
     if prompt_part:
         p = prompt_part.strip()
         if (p.startswith('"') and p.endswith('"')) or \
@@ -815,8 +821,6 @@ def handle_input(rest: str, scope: Scope):
     except EOFError:
         raw = ""
 
-    # No auto-casting/guessing: the declared type (or plain string
-    # if none was given) is the only thing that decides the value.
     if type_hint == "int":
         try:
             value = int(raw)
@@ -841,19 +845,10 @@ def handle_input(rest: str, scope: Scope):
             raise
         except Exception:
             raise OptimizeError(f"Cannot convert '{raw}' to list")
-    else:  # "str" - stay as string, no guessing
+    else:
         value = raw
 
     scope.set_auto(var_name, value)
-
-def _auto_cast(s: str):
-    if s == "True":  return True
-    if s == "False": return False
-    try:    return int(s)
-    except: pass
-    try:    return float(s)
-    except: pass
-    return s
 
 def handle_type(rest: str, scope: Scope):
     val = parse_value(rest.strip(), scope)
@@ -868,32 +863,10 @@ def handle_return(rest: str, scope: Scope):
         raise ReturnException(parse_value(rest.strip(), scope))
     raise ReturnException(None)
 
-# ─────────────────────────────────────────────
-#  Library loader
-# ─────────────────────────────────────────────
-
-def handle_library(rest: str, scope: Scope):
-    name = rest.strip()
-
-    if not name:
-        raise OptimizeError("library requires a module name.")
-
+def _load_single_library(name: str):
     opt_path = os.path.join(PACKAGE_DIR, f"{name}.opt")
     py_path  = os.path.join(PACKAGE_DIR, f"{name}.py")
 
-    # `library del <name>` — unload a previously loaded library,
-    # removing all the names it contributed to global_vars.
-    if name.startswith("del "):
-        lib_name = name[4:].strip()
-        if lib_name not in loaded_libs:
-            raise OptimizeError(f"Library '{lib_name}' is not loaded.")
-        for sym in lib_exports.get(lib_name, []):
-            global_vars.pop(sym, None)
-        loaded_libs.discard(lib_name)
-        lib_exports.pop(lib_name, None)
-        return
-
-    # Load Optimize library
     if os.path.isfile(opt_path):
         with open(opt_path, "r", encoding="utf-8-sig") as f:
             lib_lines = f.readlines()
@@ -902,7 +875,6 @@ def handle_library(rest: str, scope: Scope):
         loaded_libs.add(name)
         return
 
-    # Load Python library
     if os.path.isfile(py_path):
         spec = importlib.util.spec_from_file_location(name, py_path)
 
@@ -923,8 +895,6 @@ def handle_library(rest: str, scope: Scope):
                 global_vars[attr] = obj
                 exported.append(attr)
             elif isinstance(obj, (int, float, str, bool, list, tuple)):
-                # Export simple constants too (e.g. pi, e) so Python
-                # libraries can expose values, not just functions.
                 global_vars[attr] = list(obj) if isinstance(obj, tuple) else obj
                 exported.append(attr)
 
@@ -935,6 +905,48 @@ def handle_library(rest: str, scope: Scope):
     raise OptimizeError(
         f"Library '{name}' not found. Expected '{opt_path}' or '{py_path}'."
     )
+
+def handle_library(rest: str, scope: Scope):
+    name = rest.strip()
+
+    if not name:
+        raise OptimizeError("library requires a module name.")
+
+    if name.startswith("del "):
+        lib_name = name[4:].strip()
+        if lib_name == "allstd":
+            for mod in STANDARD_LIB_MODULES:
+                if mod in loaded_libs:
+                    for sym in lib_exports.get(mod, []):
+                        global_vars.pop(sym, None)
+                    loaded_libs.discard(mod)
+                    lib_exports.pop(mod, None)
+            return
+        if lib_name not in loaded_libs:
+            raise OptimizeError(f"Library '{lib_name}' is not loaded.")
+        for sym in lib_exports.get(lib_name, []):
+            global_vars.pop(sym, None)
+        loaded_libs.discard(lib_name)
+        lib_exports.pop(lib_name, None)
+        return
+
+    if name == "allstd":
+        missing = []
+        for mod in STANDARD_LIB_MODULES:
+            if mod in loaded_libs:
+                continue
+            try:
+                _load_single_library(mod)
+            except OptimizeError:
+                missing.append(mod)
+        if missing:
+            raise OptimizeError(
+                f"library allstd: could not find module(s): {', '.join(missing)}"
+            )
+        return
+
+    _load_single_library(name)
+
 
 # ─────────────────────────────────────────────
 #  Function call & definition
@@ -952,11 +964,6 @@ def call_function(name: str, arg_str: str, scope: Scope):
     return None
 
 def call_function_with_values(name: str, arg_values, kwarg_values=None):
-    """Like call_function, but takes already-evaluated Python values
-    instead of raw argument strings. Used so Optimize-defined
-    'function's can be called from inside a larger expression that
-    goes through safe_eval()/Python's eval(), e.g. 'add(1,2) + 3',
-    and now also supports keyword arguments, e.g. 'greet(x, y=2)'."""
     if name not in functions:
         raise OptimizeError(f"Function '{name}' is not defined.")
     fn_scope = _bind_args(name, list(arg_values), dict(kwarg_values or {}))
@@ -971,10 +978,7 @@ def call_function_with_values(name: str, arg_values, kwarg_values=None):
 # ─────────────────────────────────────────────
 
 def dispatch(line: str, scope: Scope):
-    line = line.strip()
-    if not line or line.startswith("!"):
-        return
-    line = _strip_comment(line)
+    # We no longer strip comments here since it's pre-stripped during collection/parsing steps
     if not line:
         return
 
@@ -982,18 +986,12 @@ def dispatch(line: str, scope: Scope):
     if line == "next":          raise NextException()
     if line == "stop":          raise StopException()
 
-    # `keyword del <name>` — delete a named var/list/library/function
-    # entirely, so the user can free something they no longer need.
-    # Must be checked BEFORE the normal per-keyword handlers below,
-    # since e.g. "var del x" starts with "var " and would otherwise
-    # be routed to handle_var and fail as invalid assignment syntax.
     _DEL_PREFIXES = ("var del ", "list del ", "input del ")
     for _pfx in _DEL_PREFIXES:
         if line.startswith(_pfx):
             _name = line[len(_pfx):].strip()
             if not _name.isidentifier():
                 raise OptimizeError(f"Invalid name to delete: '{_name}'")
-            # For 'function del', also remove from the functions dict.
             if line.startswith("function del ") and _name in functions:
                 del functions[_name]
                 return
@@ -1012,9 +1010,22 @@ def dispatch(line: str, scope: Scope):
     if line.startswith("type "):    return handle_type(line[5:], scope)
     if line.startswith("library "): return handle_library(line[8:], scope)
     if line.startswith("return"):   return handle_return(line[6:], scope)
+    if line.startswith("string "):
+        if "string" not in STRING_DECL_KEYWORDS:
+            raise OptimizeError("'string' declarations require 'library optstr' to be loaded.")
+        rest = line[7:].strip()
+        if "=" not in rest:
+            raise OptimizeError(f"Invalid string syntax: 'string {rest}'")
+        name, _, expr = rest.partition("=")
+        name = name.strip()
+        if not name.isidentifier():
+            raise OptimizeError(f"Invalid variable name: '{name}'")
+        value = parse_value(expr.strip(), scope)
+        if not isinstance(value, str):
+            raise OptimizeError(f"'string' declaration requires a string value, got {type(value).__name__}.")
+        assign(name, expr, scope, "auto", precomputed=value)
+        return
 
-    # Function / method call / instantiation as standalone statement:
-    # funcname(...), self.method(...), obj.method(...), ClassName(...)
     call_info = extract_function_call(line)
     if call_info:
         fname, args = call_info
@@ -1027,6 +1038,9 @@ def dispatch(line: str, scope: Scope):
         if "." in fname:
             target_expr, _, mname = fname.rpartition(".")
             target = parse_value(target_expr, scope)
+            special_value = _resolve_start_end_call(target, mname)
+            if special_value is not None:
+                return
             if isinstance(target, OptInstance):
                 method = target.cls.find_method(mname)
                 if method is None:
@@ -1050,10 +1064,6 @@ def dispatch(line: str, scope: Scope):
         if fname in functions:
             call_function(fname, args, scope)
             return
-        # Python library function called as a standalone statement
-        # (e.g. 'sort(0, len(a))' with no assignment) - same lookup
-        # parse_value() already does for expressions, just routed
-        # here for bare statements too.
         if scope.has(fname):
             fn = scope.get(fname)
             if callable(fn):
@@ -1075,7 +1085,6 @@ def dispatch(line: str, scope: Scope):
                     raise OptimizeError(f"{fname}(): {e}")
                 return
 
-    # Compound assignment: i += 1, i -= 1, self.x += 1, etc.
     for cop in ("+=", "-=", "*=", "/="):
         if cop in line:
             name, _, expr = line.partition(cop)
@@ -1083,19 +1092,28 @@ def dispatch(line: str, scope: Scope):
             if name.isidentifier() and scope.has(name):
                 current = scope.get(name)
                 delta   = safe_eval(expr.strip(), scope)
-                result  = {"+=": current + delta, "-=": current - delta,
-                           "*=": current * delta, "/=": current / delta}[cop]
+                result  = {
+                    "+=": current + delta,
+                    "-=": current - delta,
+                    "*=": current * delta,
+                    "/=": current / delta,
+                    "//=": current // delta,
+                }[cop]
                 scope.set_auto(name, result)
                 return
             if "." in name and _split_attr_chain(name):
                 current = parse_value(name, scope)
                 delta   = safe_eval(expr.strip(), scope)
-                result  = {"+=": current + delta, "-=": current - delta,
-                           "*=": current * delta, "/=": current / delta}[cop]
+                result  = {
+                    "+=": current + delta,
+                    "-=": current - delta,
+                    "*=": current * delta,
+                    "/=": current / delta,
+                    "//=": current // delta,
+                }[cop]
                 assign(name, repr(result) if isinstance(result, str) else str(result), scope, "auto")
                 return
 
-    # Bare assignment: x = value, self.attr = value, obj.attr = value
     if "=" in line:
         name, _, expr = line.partition("=")
         name = name.strip()
@@ -1118,7 +1136,6 @@ def collect_block(lines: list, start: int):
             body.append(raw); idx += 1; continue
         clean = _strip_comment(stripped)
 
-        # ADDED "class " to the tracking tuple here
         if any(clean.startswith(s) for s in ("if (", "for (", "while (", "function ", "class ")):
             depth += 1; body.append(raw); idx += 1
         elif clean == "end":
@@ -1130,6 +1147,7 @@ def collect_block(lines: list, start: int):
         else:
             body.append(raw); idx += 1
     return body, idx
+
 def _clean(lines, idx):
     return _strip_comment(lines[idx].strip())
 
@@ -1168,7 +1186,6 @@ def execute_block(lines: list, scope: Scope):
             idx += 1
         elif clean_for_check.startswith("function "):
             idx = register_function(lines, idx)
-        # ADDED: Handle class declarations
         elif clean_for_check.startswith("class "):
             idx = register_class(lines, idx)
         elif clean == "end":
@@ -1176,6 +1193,7 @@ def execute_block(lines: list, scope: Scope):
         else:
             dispatch(clean, scope)
             idx += 1
+
 # ── if ───────────────────────────────────────
 
 def execute_if(lines: list, start: int, scope: Scope) -> int:
@@ -1187,9 +1205,6 @@ def execute_if(lines: list, start: int, scope: Scope) -> int:
 
     if safe_eval(condition, scope):
         execute_block(body, scope.child())
-        # Skip over any elseif/else branches that follow (they don't
-        # run, since the if-condition was already true), consuming
-        # the 'end' only once we reach it.
         while idx < len(lines):
             c = strip_trailing_colon(_clean(lines, idx))
             if c.startswith("elseif (") or c == "else":
@@ -1243,67 +1258,92 @@ def execute_for(lines: list, start: int, scope: Scope) -> int:
     clean = strip_trailing_colon(_clean(lines, idx))
     inner = extract_parens(clean[3:].strip())
     parts = split_top_level(inner)
-    if len(parts) != 3:
-        raise OptimizeError(
-            f"for loop requires exactly 3 parts (variable, update, condition), got {len(parts)}.")
-
-    var_part, update_stmt, condition = [p.strip() for p in parts]
+    
+    var_part, condition, update_stmt = [p.strip() for p in parts]
 
     idx += 1
     body, idx = collect_block(lines, idx)
-    if idx >= len(lines) or _clean(lines, idx) != "end":
-        raise OptimizeError("Expected 'end' after for loop body")
-    idx += 1
+    idx += 1  # Skip 'end'
 
-    loop_scope = scope.child()
-
+    # Handle loop initialization (e.g., i=1)
     if "=" in var_part:
-        name, _, expr = var_part.partition("=")
-        name = name.strip()
-        if not name.isidentifier():
-            raise OptimizeError(f"Invalid loop variable: '{var_part}'")
-        loop_scope.set_local(name, parse_value(expr.strip(), scope))
-    else:
-        name = var_part.strip()
-        if not name.isidentifier():
-            raise OptimizeError(f"Invalid loop variable: '{var_part}'")
-        if scope.has(name):
-            loop_scope.set_local(name, scope.get(name))
-        else:
-            raise OptimizeError(
-                f"Variable '{name}' is not declared. "
-                f"Use 'for ({name} = <start>, ...)' to initialize it inline.")
+        var_name, _, init_expr = var_part.partition("=")
+        var_name = var_name.strip()
+        scope.set_auto(var_name, parse_value(init_expr.strip(), scope))
 
-    def run_update():
+    # Translate body to Python statements
+    py_body_lines = []
+    parsed_body = pre_parse_block(body)
+    
+    for cmd in parsed_body:
+        cmd_str = cmd.strip()
+        
+        # Strip internal 'var ' declarations inside the loop to avoid local scope re-allocation overhead
+        if cmd_str.startswith("var "):
+            cmd_str = cmd_str[4:].strip()
+
+        # Translate display statement to use our fast buffered system
+        if cmd_str.startswith("display "):
+            expr = cmd_str[8:].strip()
+            # Convert string concatenation '+' to commas for python print arguments if needed, 
+            # or keep it as a clean expression evaluation
+            py_body_lines.append(f"    JIT_display({expr})")
+            continue
+
+        # Handle typical assignments/mutations
+        translated = False
         for cop in ("+=", "-=", "*=", "/="):
-            if cop in update_stmt:
-                uname, _, uexpr = update_stmt.partition(cop)
-                uname = uname.strip()
-                cur   = loop_scope.get(uname)
-                delta = safe_eval(uexpr.strip(), loop_scope)
-                new   = {"+=": cur + delta, "-=": cur - delta,
-                         "*=": cur * delta, "/=": cur / delta}[cop]
-                loop_scope.set_local(uname, new)
-                return
-        if "=" in update_stmt:
-            uname, _, uexpr = update_stmt.partition("=")
-            uname = uname.strip()
-            loop_scope.set_local(uname, parse_value(uexpr.strip(), loop_scope))
-        elif update_stmt:
-            dispatch(update_stmt, loop_scope)
+            if cop in cmd_str:
+                target, _, expr = cmd_str.partition(cop)
+                py_body_lines.append(f"    {target.strip()} {cop} {expr.strip()}")
+                translated = True
+                break
+        
+        if not translated and "=" in cmd_str:
+            target, _, expr = cmd_str.partition("=")
+            py_body_lines.append(f"    {target.strip()} = {expr.strip()}")
+            translated = True
+            
+        if not translated:
+            py_body_lines.append(f"    dispatch({repr(cmd_str)}, scope)")
 
-    try:
-        while safe_eval(condition, loop_scope):
-            try:
-                execute_block(body, loop_scope)
-            except NextException:
-                pass
-            run_update()
-    except StopException:
-        pass
+    # Translate standard unary increment/decrement patterns like i++ or i--
+    if update_stmt.endswith("++"):
+        v_name = update_stmt[:-2].strip()
+        py_body_lines.append(f"    {v_name} += 1")
+    elif update_stmt.endswith("--"):
+        v_name = update_stmt[:-2].strip()
+        py_body_lines.append(f"    {v_name} -= 1")
+    elif "+=" in update_stmt or "=" in update_stmt:
+        py_body_lines.append(f"    {update_stmt}")
+
+    # Build loop compilation structure
+    # Convert operators like '<=' to native python syntax if needed
+    py_condition = condition.replace("<=", "<=") 
+    
+    loop_code = f"while {py_condition}:\n" + "\n".join(py_body_lines)
+
+    # Prepare execution environment
+    context = {
+        **SAFE_BUILTINS, 
+        **scope.as_dict(), 
+        "dispatch": dispatch, 
+        "scope": scope, 
+        "JIT_display": JIT_display
+    }
+    
+    # Run loop code at machine speed
+    exec(loop_code, {"__builtins__": {}}, context)
+
+    # Flush any remaining items in the print buffer
+    flush_buffer()
+
+    # Synchronize values back to interpreter state
+    for k, v in context.items():
+        if scope.has(k) or k in (var_name, 'ref'):
+            scope.set_auto(k, v)
 
     return idx
-
 # ── while ────────────────────────────────────
 
 def execute_while(lines: list, start: int, scope: Scope) -> int:
@@ -1316,18 +1356,40 @@ def execute_while(lines: list, start: int, scope: Scope) -> int:
         raise OptimizeError("Expected 'end' after while loop body")
     idx += 1
 
-    try:
-        while safe_eval(condition, scope):
-            try:
-                execute_block(body, scope.child())
-            except NextException:
-                pass
-    except StopException:
-        pass
+    py_body_lines = []
+    parsed_body = pre_parse_block(body)
+    
+    for cmd in parsed_body:
+        translated = False
+        for cop in ("+=", "-=", "*=", "/="):
+            if cop in cmd:
+                target, _, expr = cmd.partition(cop)
+                target = target.strip()
+                if target.isidentifier():
+                    py_body_lines.append(f"    {target} {cop} {expr}")
+                    translated = True
+                    break
+        if not translated and "=" in cmd:
+            target, _, expr = cmd.partition("=")
+            target = target.strip()
+            if target.isidentifier():
+                py_body_lines.append(f"    {target} = {expr}")
+                translated = True
+                
+        if not translated:
+            py_body_lines.append(f"    dispatch({repr(cmd)}, scope)")
+
+    loop_code = f"while {condition}:\n" + "\n".join(py_body_lines)
+
+    context = {**SAFE_BUILTINS, **scope.as_dict(), "dispatch": dispatch, "scope": scope}
+    exec(loop_code, {"__builtins__": {}}, context)
+
+    for k, v in context.items():
+        if scope.has(k):
+            scope.set_auto(k, v)
 
     return idx
-
-# ── function ─────────────────────────────────
+# ── function / class mechanics ───────────────
 
 def register_function(lines: list, start: int) -> int:
     idx   = start
@@ -1350,17 +1412,13 @@ def register_function(lines: list, start: int) -> int:
     }
     return idx
 
-# ─────────────────────────────────────────────
-#  Entry point
-# ─────────────────────────────────────────────
 def register_class(lines: list, start: int) -> int:
     idx   = start
     clean = strip_trailing_colon(_clean(lines, idx))
-    rest  = clean[5:].strip()  # Strip 'class'
+    rest  = clean[5:].strip()
     idx  += 1
 
     parent = None
-    # Support python-style inheritance: class Child(Parent)
     if "(" in rest:
         if not rest.endswith(")"):
             raise OptimizeError(f"Invalid class syntax: 'class {rest}'")
@@ -1368,7 +1426,7 @@ def register_class(lines: list, start: int) -> int:
         pname = rest[rest.index("(")+1:-1].strip()
         if pname:
             if pname not in classes:
-                raise OptimizeError(f"Parent class '{pname}' is not defined.")
+                raise
             parent = classes[pname]
     else:
         cname = rest
@@ -1383,7 +1441,6 @@ def register_class(lines: list, start: int) -> int:
 
     cls = OptClass(cname, parent)
 
-    # Parse methods out of the class block body
     b_idx = 0
     while b_idx < len(body):
         b_raw = body[b_idx].rstrip()
@@ -1423,7 +1480,7 @@ def register_class(lines: list, start: int) -> int:
         elif b_clean == "end":
             b_idx += 1
         else:
-            raise OptimizeError(f"Only methods ('function') are allowed directly inside a class body. Got: '{b_clean}'")
+            raise OptimizeError(f"Only methods are allowed inside a class body. Got: '{b_clean}'")
 
     classes[cname] = cls
     return idx

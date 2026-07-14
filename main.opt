@@ -63,7 +63,7 @@ end
 display "4. Loops"
 
 display "Counting with for:"
-for (i = 0, i += 1, i < len(fruits)):
+for (i = 0, i < len(fruits), i+=1):
     display fruits[i]
 end
 
