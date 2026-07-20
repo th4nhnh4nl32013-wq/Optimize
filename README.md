@@ -7,3 +7,11 @@ To download Optimize, go to release and click on the latest version (0.4), then 
 After download, go to CMD (or any terminal) and type `optimize`. It will show Optimize IDE on your terminal.
 
 Tutorial book coming soon
+
+Sample code:
+```
+library optmath
+var x = 4
+input int y
+display fraction_add((x, y), (y, x))
+```
