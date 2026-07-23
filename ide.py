@@ -6,6 +6,36 @@ from main import (
     safe_eval, parse_value
 )
 
+class _NewlineTrackingStream:
+    """Wraps stdout so the REPL can tell whether the cursor is at the
+    start of a line. 'display' without 'bl' doesn't print a trailing
+    newline (by design, for same-line concatenation), so without this
+    the next '>>' prompt gets glued onto the previous output."""
+    def __init__(self, stream):
+        self._stream = stream
+        self.at_line_start = True
+
+    def write(self, s):
+        if s:
+            self.at_line_start = s.endswith("\n")
+        return self._stream.write(s)
+
+    def flush(self):
+        self._stream.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _prompt_input(prompt):
+    """input() that first ensures we're on a fresh line if the last
+    thing printed (e.g. a display without 'bl') left the cursor
+    mid-line."""
+    if not sys.stdout.at_line_start:
+        sys.stdout.write("\n")
+    return input(prompt)
+
+
 def try_eval_expression(clean, scope):
     keywords = ("display ", "var ", "list ", "add ", "del ", "input ",
                 "type ", "library ", "return", "if (", "for (", "while (",
@@ -36,7 +66,7 @@ def repl():
 
     while True:
         try:
-            line = input(prompt)
+            line = _prompt_input(prompt)
         except EOFError:
             break
 
@@ -85,6 +115,7 @@ def repl():
             pass
 
 if __name__ == "__main__":
+    sys.stdout = _NewlineTrackingStream(sys.stdout)
     print("Optimize CMD v0.4")
     print("----------------------------------------")
     repl()

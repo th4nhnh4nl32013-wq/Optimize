@@ -151,11 +151,12 @@ def flush_buffer():
         sys.stdout.write("".join(OUTPUT_BUFFER))
         OUTPUT_BUFFER.clear()
 
-def JIT_display(*args):
-    # Joins items together and caches them instead of direct heavy printing
-    msg = " ".join(str(x) for x in args) + "\n"
+def JIT_display(*args, end=False):
+    msg = " ".join(str(x) for x in args)
+    if end:
+        msg += "\n"
     OUTPUT_BUFFER.append(msg)
-    if len(OUTPUT_BUFFER) > 20000:  # Periodically flush large chunks
+    if len(OUTPUT_BUFFER) > 20000:
         flush_buffer()
 
 def _call_method(instance: "OptInstance", method: dict, arg_values: list, kwarg_values: dict):
@@ -782,12 +783,10 @@ def _get_list(name: str, scope: Scope):
         raise OptimizeError(f"'{name}' is not a list.")
     return val
 
-VALID_INPUT_TYPES = ("int", "float", "str", "bool", "list")
-
 def handle_input(rest: str, scope: Scope):
     rest = rest.strip()
     if not rest:
-        raise OptimizeError("input requires a variable name.")
+        raise OptimizeError("input requires a type and variable name: 'input <type> <name>'")
 
     parts = rest.split(None, 2)
 
@@ -796,16 +795,17 @@ def handle_input(rest: str, scope: Scope):
             f"input type '{parts[0]}' requires 'library optstr' to be loaded."
         )
 
-    if parts[0] in VALID_INPUT_TYPES:
-        type_hint = parts[0]
-        if len(parts) < 2:
-            raise OptimizeError(f"Invalid input syntax: 'input {rest}'")
-        var_name = parts[1]
-        prompt_part = parts[2] if len(parts) >= 3 else ""
-    else:
-        type_hint = "str"
-        var_name = parts[0]
-        prompt_part = parts[1] if len(parts) >= 2 else ""
+    if parts[0] not in VALID_INPUT_TYPES:
+        raise OptimizeError(
+            f"input requires an explicit type: 'input <type> {rest}' "
+            f"(valid types: {', '.join(VALID_INPUT_TYPES)})"
+        )
+
+    type_hint = parts[0]
+    if len(parts) < 2:
+        raise OptimizeError(f"Invalid input syntax: 'input {rest}'")
+    var_name = parts[1]
+    prompt_part = parts[2] if len(parts) >= 3 else ""
 
     prompt = ""
     if prompt_part:
@@ -921,6 +921,8 @@ def handle_library(rest: str, scope: Scope):
                         global_vars.pop(sym, None)
                     loaded_libs.discard(mod)
                     lib_exports.pop(mod, None)
+                    if mod in LIB_UNLOAD_HOOKS:
+                        LIB_UNLOAD_HOOKS.pop(mod)()
             return
         if lib_name not in loaded_libs:
             raise OptimizeError(f"Library '{lib_name}' is not loaded.")
@@ -928,6 +930,8 @@ def handle_library(rest: str, scope: Scope):
             global_vars.pop(sym, None)
         loaded_libs.discard(lib_name)
         lib_exports.pop(lib_name, None)
+        if lib_name in LIB_UNLOAD_HOOKS:
+            LIB_UNLOAD_HOOKS.pop(lib_name)()
         return
 
     if name == "allstd":
@@ -1117,9 +1121,14 @@ def dispatch(line: str, scope: Scope):
     if "=" in line:
         name, _, expr = line.partition("=")
         name = name.strip()
-        if name.isidentifier() or (( "." in name) and _split_attr_chain(name)):
+        if name.isidentifier() and scope.has(name):
             assign(name, expr, scope, "auto")
             return
+        if "." in name and _split_attr_chain(name):
+            assign(name, expr, scope, "auto")
+            return
+        if name.isidentifier() and not scope.has(name):
+            raise OptimizeError(f"'{name}' is not defined. Use 'var {name} = ...' to declare it.")
 
     raise OptimizeError(f"Unknown statement: '{line}'")
 
@@ -1285,9 +1294,12 @@ def execute_for(lines: list, start: int, scope: Scope) -> int:
         # Translate display statement to use our fast buffered system
         if cmd_str.startswith("display "):
             expr = cmd_str[8:].strip()
-            # Convert string concatenation '+' to commas for python print arguments if needed, 
-            # or keep it as a clean expression evaluation
-            py_body_lines.append(f"    JIT_display({expr})")
+            breakline = False
+            m = _BL_SUFFIX_PATTERN.search(expr)
+            if m:
+                breakline = True
+                expr = expr[:m.start()].strip()
+            py_body_lines.append(f"    JIT_display({expr}, end={breakline!r})")
             continue
 
         # Handle typical assignments/mutations
